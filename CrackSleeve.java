@@ -1,8 +1,10 @@
 import dns.SleeveSecurity;
 import java.io.*;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
+import java.net.URL;
 import java.nio.file.Files;
+import java.util.Enumeration;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
 
 public class CrackSleeve {
@@ -11,7 +13,6 @@ public class CrackSleeve {
 
     private String DecDir = "Resource/Decode/sleeve";
     private String EncDir = "Resource/Encode/sleeve";
-    private String SleeveDir = "sleeve"; // 本地 sleeve 文件夹路径
 
     public static void main(String[] args) throws IOException {
         if (args.length == 0 || args[0].equals("-h") || args[0].equals("--help")) {
@@ -24,10 +25,10 @@ public class CrackSleeve {
         String option = args[0];
 
         CrackSleeve Cracker = new CrackSleeve();
-        if (option.equals("decode")){
+        if (option.equals("decode")) {
             CrackSleevedResource.Setup(OriginKey);
             Cracker.DecodeFile();
-        } else if (option.equals("encode")){
+        } else if (option.equals("encode")) {
             CrackSleevedResource.Setup(CustomizeKey);
             Cracker.EncodeFile();
         }
@@ -39,28 +40,49 @@ public class CrackSleeve {
         if (!saveDir.isDirectory())
             saveDir.mkdirs();
 
-        // 读取本地 sleeve 文件夹下的所有 DLL 文件
-        File sleeveDir = new File(this.SleeveDir);
-        if (!sleeveDir.isDirectory()) {
-            System.out.println("[-] sleeve directory not found: " + sleeveDir.getAbsolutePath());
+        // 定位 cobaltstrike.jar 路径（通过 ClassLoader 找到含 sleeve/ 的 jar）
+        URL sleeveUrl = CrackSleeve.class.getClassLoader().getResource("sleeve");
+        if (sleeveUrl == null) {
+            System.out.println("[-] Cannot find 'sleeve' resource in classpath.");
             System.exit(1);
         }
 
-        File[] dllFiles = sleeveDir.listFiles((dir, name) -> name.toLowerCase().endsWith(".dll"));
-        if (dllFiles == null || dllFiles.length == 0) {
-            System.out.println("[-] No DLL files found in: " + sleeveDir.getAbsolutePath());
-            System.exit(1);
-        }
+        // 格式: jar:file:/path/to/cobaltstrike.jar!/sleeve
+        String urlStr = sleeveUrl.toString();
+        String jarPath = urlStr.substring("jar:file:".length(), urlStr.indexOf("!/"));
 
-        for (File dllFile : dllFiles) {
-            System.out.print("[+] Decoding sleeve/" + dllFile.getName() + "......");
-            byte[] decBytes = CrackSleevedResource.DecodeResourceFromFile(dllFile);
-            if (decBytes != null && decBytes.length > 0) {
-                File outFile = new File(saveDir, dllFile.getName());
-                writeFile(outFile, decBytes);
-                System.out.println("Done. (" + decBytes.length + " bytes -> " + outFile.getPath() + ")");
-            } else {
-                System.out.println("Fail.");
+        System.out.println("[*] Reading from jar: " + jarPath);
+
+        try (JarFile jarFile = new JarFile(new File(jarPath))) {
+            Enumeration<JarEntry> entries = jarFile.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                String name = entry.getName();
+
+                // 只处理 sleeve/ 下的 .dll 文件，跳过目录本身
+                if (!name.startsWith("sleeve/") || entry.isDirectory())
+                    continue;
+                if (!name.toLowerCase().endsWith(".dll"))
+                    continue;
+
+                System.out.print("[+] Decoding " + name + "......");
+
+                // 直接从 jar 流中读取原始字节，完全不经过 CommonUtils
+                byte[] rawBytes = readJarEntry(jarFile, entry);
+                if (rawBytes == null || rawBytes.length == 0) {
+                    System.out.println("Fail. (empty)");
+                    continue;
+                }
+
+                byte[] decBytes = CrackSleevedResource.Decrypt(rawBytes);
+                if (decBytes != null && decBytes.length > 0) {
+                    String fileName = name.substring(name.lastIndexOf('/') + 1);
+                    File outFile = new File(saveDir, fileName);
+                    writeFile(outFile, decBytes);
+                    System.out.println("Done. (" + decBytes.length + " bytes -> " + outFile.getPath() + ")");
+                } else {
+                    System.out.println("Fail. (decrypt returned empty)");
+                }
             }
         }
     }
@@ -80,7 +102,7 @@ public class CrackSleeve {
 
         for (File file : decFiles) {
             System.out.print("[+] Encoding " + file.getName() + "......");
-            byte[] encBytes = CrackSleevedResource.EncodeResource(file);
+            byte[] encBytes = CrackSleevedResource.Encrypt(file);
             if (encBytes != null && encBytes.length > 0) {
                 File outFile = new File(saveDir, file.getName());
                 writeFile(outFile, encBytes);
@@ -91,7 +113,18 @@ public class CrackSleeve {
         }
     }
 
-    // ===== 纯 Java 原生文件读写，完全不依赖 CommonUtils =====
+    // ===== 原生文件读写，完全不依赖 CommonUtils =====
+
+    public static byte[] readJarEntry(JarFile jarFile, JarEntry entry) throws IOException {
+        try (InputStream is = jarFile.getInputStream(entry);
+             ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) != -1)
+                baos.write(buf, 0, n);
+            return baos.toByteArray();
+        }
+    }
 
     public static byte[] readFile(File file) throws IOException {
         return Files.readAllBytes(file.toPath());
@@ -102,6 +135,7 @@ public class CrackSleeve {
         Files.write(file.toPath(), data);
     }
 }
+
 
 class CrackSleevedResource {
     private static CrackSleevedResource singleton;
@@ -115,43 +149,30 @@ class CrackSleevedResource {
         this.data.registerKey(key);
     }
 
-    /**
-     * 直接从本地 File 读取原始字节并解密，完全不经过 CommonUtils
-     */
-    public static byte[] DecodeResourceFromFile(File file) {
-        return singleton._DecodeResourceFromFile(file);
+    /** 解密原始字节 */
+    public static byte[] Decrypt(byte[] raw) {
+        return singleton._decrypt(raw);
     }
 
-    /**
-     * 从本地 File 读取字节并加密
-     */
-    public static byte[] EncodeResource(File file) {
-        return singleton._EncodeResource(file);
+    /** 从文件读取并加密 */
+    public static byte[] Encrypt(File file) {
+        return singleton._encrypt(file);
     }
 
-    private byte[] _DecodeResourceFromFile(File file) {
+    private byte[] _decrypt(byte[] raw) {
         try {
-            byte[] raw = CrackSleeve.readFile(file);
-            if (raw.length > 0) {
-                return this.data.decrypt(raw);
-            } else {
-                System.err.println("[-] File is empty: " + file.getPath());
-            }
-        } catch (IOException e) {
-            System.err.println("[-] Failed to read: " + file.getPath());
-            e.printStackTrace();
+            return this.data.decrypt(raw);
+        } catch (Exception e) {
+            System.err.println("[-] Decrypt error: " + e.getMessage());
+            return new byte[0];
         }
-        return new byte[0];
     }
 
-    private byte[] _EncodeResource(File file) {
+    private byte[] _encrypt(File file) {
         try {
             byte[] raw = CrackSleeve.readFile(file);
-            if (raw.length > 0) {
+            if (raw.length > 0)
                 return this.data.encrypt(raw);
-            } else {
-                System.err.println("[-] File is empty: " + file.getPath());
-            }
         } catch (IOException e) {
             System.err.println("[-] Failed to read: " + file.getPath());
             e.printStackTrace();
